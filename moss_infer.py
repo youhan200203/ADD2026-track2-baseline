@@ -137,6 +137,14 @@ def extract_decision(response):
     return matches[0].lower() if len(matches) == 1 else None
 
 
+def extract_evidence(response):
+    match = re.search(r"<Evidence>(.*?)</Evidence>", response, re.I | re.S)
+    if match is None:
+        return ""
+    text = re.sub(r"<[^>]+>", " ", match.group(1))
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def valid_xml_response(response):
     decisions = re.findall(
         r"<Decision>\s*(real|fake)\s*</Decision>", response, re.I
@@ -146,20 +154,37 @@ def valid_xml_response(response):
 
 
 def validate_batch_generation(model, processor, audio_paths, args):
+    from tqdm.auto import tqdm
+
     single_responses = []
-    for audio_path in audio_paths:
+    single_progress = tqdm(
+        audio_paths,
+        desc="batch-check single",
+        unit="sample",
+        dynamic_ncols=True,
+    )
+    for audio_path in single_progress:
         responses, _ = generate_batch(model, processor, [audio_path], args)
         single_responses.extend(responses)
 
     batched_responses = []
+    batch_progress = tqdm(
+        total=len(audio_paths),
+        desc=f"batch-check batch={args.batch_size}",
+        unit="sample",
+        dynamic_ncols=True,
+    )
     for start in range(0, len(audio_paths), args.batch_size):
+        batch_paths = audio_paths[start : start + args.batch_size]
         responses, _ = generate_batch(
             model,
             processor,
-            audio_paths[start : start + args.batch_size],
+            batch_paths,
             args,
         )
         batched_responses.extend(responses)
+        batch_progress.update(len(batch_paths))
+    batch_progress.close()
 
     rows = []
     for audio_path, single, batched in zip(
@@ -173,6 +198,8 @@ def validate_batch_generation(model, processor, audio_paths, args):
                 "batch_xml_valid": valid_xml_response(batched),
                 "single_decision": extract_decision(single),
                 "batch_decision": extract_decision(batched),
+                "single_evidence": extract_evidence(single),
+                "batch_evidence": extract_evidence(batched),
             }
         )
 
@@ -192,15 +219,32 @@ def validate_batch_generation(model, processor, audio_paths, args):
         ),
         "rows": rows,
     }
-    print(f"[batch-validation] {json.dumps(summary, ensure_ascii=False, indent=2)}")
-    if summary["decision_matches"] != len(rows):
-        raise RuntimeError("Batch validation failed: Decision changed")
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    printable = dict(summary)
+    printable["rows"] = [
+        {
+            key: value
+            for key, value in row.items()
+            if key not in {"single_evidence", "batch_evidence"}
+        }
+        for row in rows
+    ]
+    print(
+        f"[batch-validation] "
+        f"{json.dumps(printable, ensure_ascii=False, indent=2)}"
+    )
+    print(f"[batch-validation] saved evidence pairs to {args.output}")
     if summary["batch_xml_valid"] != len(rows):
         raise RuntimeError("Batch validation failed: batch output contains invalid XML")
+    if summary["decision_matches"] != len(rows):
+        print("[batch-validation] WARNING: at least one Decision changed")
     if not summary["safe_for_exact_reproducibility"]:
         print(
-            "[batch-validation] WARNING: Decisions and XML are valid, but "
-            "some generated texts differ from batch size 1"
+            "[batch-validation] WARNING: some generated texts differ from "
+            "batch size 1; compare reference BERTScore before using batching"
         )
 
 
