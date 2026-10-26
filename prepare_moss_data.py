@@ -105,31 +105,89 @@ def write_jsonl(path, records):
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def balanced_overfit_records(records, per_class):
+    by_label = {
+        label: sorted(
+            (record for record in records if record["label"] == label),
+            key=lambda record: record["id"],
+        )[:per_class]
+        for label in ("real", "fake")
+    }
+    for label, rows in by_label.items():
+        if len(rows) != per_class:
+            raise ValueError(
+                f"Need {per_class} {label} samples, found {len(rows)}"
+            )
+
+    selected = []
+    for index in range(per_class):
+        selected.extend((by_label["real"][index], by_label["fake"][index]))
+    return selected
+
+
+def evaluation_subset(records, split):
+    subset = []
+    for record in records:
+        answer = record["conversation"][-1]["content"]
+        subset.append(
+            {
+                "id": record["id"],
+                "label": record["label"],
+                "audios": [f"data/{split}/{record['id']}.wav"],
+                "messages": [
+                    {"role": "system", "content": SYSTEM},
+                    {"role": "user", "content": USER},
+                    {"role": "assistant", "content": answer},
+                ],
+            }
+        )
+    return subset
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-root", type=Path, default=Path("data"))
     parser.add_argument("--output-dir", type=Path, default=Path("data/moss"))
     parser.add_argument("--train-limit", type=int)
     parser.add_argument("--dev-limit", type=int)
+    parser.add_argument("--overfit-per-class", type=int, default=4)
     args = parser.parse_args()
 
     if args.train_limit is not None and args.train_limit <= 0:
         parser.error("--train-limit must be positive")
     if args.dev_limit is not None and args.dev_limit <= 0:
         parser.error("--dev-limit must be positive")
+    if args.overfit_per_class <= 0:
+        parser.error("--overfit-per-class must be positive")
 
     data_root = args.data_root.resolve()
+    split_records = {}
     for split, limit in (
         ("train", args.train_limit),
         ("dev", args.dev_limit),
     ):
         records, counts = convert_split(data_root, split, limit)
+        split_records[split] = records
         output_path = args.output_dir / f"{split}.jsonl"
         write_jsonl(output_path, records)
         print(
             f"[saved] {output_path}: {len(records)} samples "
             f"(real={counts['real']}, fake={counts['fake']})"
         )
+
+    overfit = balanced_overfit_records(
+        split_records["train"], args.overfit_per_class
+    )
+    total = len(overfit)
+    overfit_path = args.output_dir / f"overfit_{total}.jsonl"
+    subset_path = args.output_dir / f"overfit_{total}_subset.jsonl"
+    write_jsonl(overfit_path, overfit)
+    write_jsonl(subset_path, evaluation_subset(overfit, "train"))
+    print(
+        f"[saved] {overfit_path}: {total} fixed samples "
+        f"(real={args.overfit_per_class}, fake={args.overfit_per_class})"
+    )
+    print(f"[saved] {subset_path}: {total} evaluation references")
 
 
 if __name__ == "__main__":
