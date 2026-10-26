@@ -1,0 +1,23 @@
+.DS_Store
+.ipynb_checkpoints/
+__pycache__/
+*.py[cod]
+
+# ADD 2026 data must not be redistributed.
+data/*
+!data/README.md
+*.wav
+
+# Downloaded model weights and archives.
+track2_baseline_weights/
+*.safetensors
+*.bin
+*.zip
+
+# Generated manifests, predictions, logs, and training outputs.
+outputs/
+runs/
+prediction.jsonl
+raw_predictions.jsonl
+*.joint_eval.json
+*.log
