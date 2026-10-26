@@ -14,6 +14,118 @@ from pathlib import Path
 os.environ.setdefault("USE_TF", "0")
 
 
+FIXED_BATCH_KEYS = (
+    "input_ids",
+    "labels",
+    "attention_mask",
+    "audio_input_mask",
+)
+
+
+def downsampled_audio_tokens(frame_count):
+    for _ in range(3):
+        frame_count = (frame_count - 1) // 2 + 1
+    return frame_count
+
+
+class MossAudioDataCollator:
+    """Right-pad variable-length mel features without changing sample order."""
+
+    def __init__(self):
+        self.reported = False
+
+    def __call__(self, features):
+        import torch
+
+        if not features:
+            raise ValueError("Cannot collate an empty MOSS-Audio batch")
+
+        required = {*FIXED_BATCH_KEYS, "audio_data", "audio_data_seqlens"}
+        for index, feature in enumerate(features):
+            missing = required.difference(feature)
+            if missing:
+                raise KeyError(
+                    f"MOSS-Audio sample {index} is missing keys: {sorted(missing)}"
+                )
+
+        batch = {}
+        for key in FIXED_BATCH_KEYS:
+            reference_shape = tuple(features[0][key].shape)
+            for index, feature in enumerate(features[1:], start=1):
+                shape = tuple(feature[key].shape)
+                if shape != reference_shape:
+                    raise RuntimeError(
+                        f"Cannot stack {key}: sample 0 has {reference_shape}, "
+                        f"sample {index} has {shape}"
+                    )
+            batch[key] = torch.stack([feature[key] for feature in features])
+
+        audio_features = [feature["audio_data"] for feature in features]
+        reference_mels = int(audio_features[0].shape[0])
+        reference_dtype = audio_features[0].dtype
+        frame_lengths = []
+        for index, (audio, feature) in enumerate(zip(audio_features, features)):
+            if audio.ndim != 2:
+                raise RuntimeError(
+                    f"audio_data for sample {index} must be [n_mels, T], "
+                    f"got {tuple(audio.shape)}"
+                )
+            if int(audio.shape[0]) != reference_mels:
+                raise RuntimeError(
+                    f"audio_data mel bins differ: expected {reference_mels}, "
+                    f"got {int(audio.shape[0])} for sample {index}"
+                )
+            if audio.dtype != reference_dtype:
+                raise RuntimeError(
+                    f"audio_data dtype differs for sample {index}: "
+                    f"expected {reference_dtype}, got {audio.dtype}"
+                )
+            declared_length = int(feature["audio_data_seqlens"].item())
+            actual_length = int(audio.shape[-1])
+            if declared_length != actual_length or declared_length <= 0:
+                raise RuntimeError(
+                    f"audio_data_seqlens mismatch for sample {index}: "
+                    f"declared={declared_length}, actual={actual_length}"
+                )
+            frame_lengths.append(declared_length)
+
+        max_frames = max(frame_lengths)
+        padded_audio = audio_features[0].new_zeros(
+            (len(features), reference_mels, max_frames)
+        )
+        for index, (audio, frame_length) in enumerate(
+            zip(audio_features, frame_lengths)
+        ):
+            padded_audio[index, :, :frame_length].copy_(audio)
+
+        expected_audio_tokens = [
+            downsampled_audio_tokens(frame_length)
+            for frame_length in frame_lengths
+        ]
+        mask_audio_tokens = [
+            int(value)
+            for value in batch["audio_input_mask"].sum(dim=1).tolist()
+        ]
+        if mask_audio_tokens != expected_audio_tokens:
+            raise RuntimeError(
+                "DeepStack audio-token alignment failed: "
+                f"mask={mask_audio_tokens}, encoded={expected_audio_tokens}"
+            )
+
+        batch["audio_data"] = padded_audio
+        batch["audio_data_seqlens"] = torch.tensor(
+            frame_lengths, dtype=torch.long
+        )
+        if not self.reported:
+            print(
+                "[collator] validated right-padded batch: "
+                f"batch={len(features)}, frames={frame_lengths}, "
+                f"padded_to={max_frames}, audio_tokens={expected_audio_tokens}"
+            )
+            self.reported = True
+        return batch
+
+
 def parse_wrapper_args():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--moss-repo", type=Path, required=True)
@@ -35,7 +147,7 @@ def argument_value(arguments, name, default=None):
 def latest_checkpoint(output_dir):
     checkpoints = []
     for path in output_dir.glob("checkpoint-*"):
-        if not path.is_dir():
+        if not path.is_dir() or not (path / "trainer_state.json").is_file():
             continue
         try:
             step = int(path.name.rsplit("-", 1)[1])
@@ -43,6 +155,20 @@ def latest_checkpoint(output_dir):
             continue
         checkpoints.append((step, path))
     return max(checkpoints, default=(None, None))[1]
+
+
+def load_registered_module(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load module {name} from {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
+    return module
 
 
 def directory_size(path, recursive=True):
@@ -172,6 +298,117 @@ def install_safe_gradient_checkpointing(model, captured):
     model.gradient_checkpointing_enable = safe_enable
 
 
+def validate_deepstack_batch(trainer):
+    import torch
+
+    batch_size = int(trainer.args.per_device_train_batch_size)
+    if batch_size <= 1:
+        return {"performed": False, "reason": "batch_size=1"}
+    if len(trainer.train_dataset) < batch_size:
+        raise RuntimeError(
+            f"Training dataset has fewer rows than batch size {batch_size}"
+        )
+
+    features = [trainer.train_dataset[index] for index in range(batch_size)]
+    frame_lengths = [int(feature["audio_data"].shape[-1]) for feature in features]
+    if len(set(frame_lengths)) == 1:
+        for index in range(batch_size, min(len(trainer.train_dataset), 32)):
+            candidate = trainer.train_dataset[index]
+            if int(candidate["audio_data"].shape[-1]) != frame_lengths[0]:
+                features[-1] = candidate
+                break
+    batch = trainer.data_collator(features)
+    moss_model = resolve_moss_model(trainer.model)
+    device = next(moss_model.parameters()).device
+    was_training = moss_model.training
+    moss_model.eval()
+    try:
+        with torch.no_grad():
+            batch_audio, batch_deepstack = moss_model.get_audio_features(
+                batch["audio_data"].to(device),
+                batch["audio_data_seqlens"].to(device),
+            )
+            single_audio_parts = []
+            single_deepstack_parts = None
+            for index, frame_length in enumerate(
+                batch["audio_data_seqlens"].tolist()
+            ):
+                single_audio, single_deepstack = moss_model.get_audio_features(
+                    batch["audio_data"][index, :, :frame_length].to(device),
+                    torch.tensor([frame_length], device=device),
+                )
+                single_audio_parts.append(single_audio)
+                if single_deepstack_parts is None:
+                    single_deepstack_parts = [
+                        [] for _ in range(len(single_deepstack or ()))
+                    ]
+                if len(single_deepstack or ()) != len(single_deepstack_parts):
+                    raise RuntimeError(
+                        "DeepStack output count differs between samples"
+                    )
+                for layer_index, hidden in enumerate(single_deepstack or ()):
+                    single_deepstack_parts[layer_index].append(hidden)
+
+            expected_audio = torch.cat(single_audio_parts, dim=1)
+            expected_deepstack = [
+                torch.cat(parts, dim=1)
+                for parts in (single_deepstack_parts or [])
+            ]
+            if len(batch_deepstack or ()) != len(expected_deepstack):
+                raise RuntimeError(
+                    "DeepStack output count differs between batched and "
+                    "single-sample forwards"
+                )
+
+            comparisons = [("audio", batch_audio, expected_audio)]
+            comparisons.extend(
+                (
+                    f"deepstack_{layer_index}",
+                    batch_hidden,
+                    expected_hidden,
+                )
+                for layer_index, (batch_hidden, expected_hidden) in enumerate(
+                    zip(batch_deepstack or (), expected_deepstack)
+                )
+            )
+            max_absolute_difference = 0.0
+            for name, actual, expected in comparisons:
+                if actual.shape != expected.shape:
+                    raise RuntimeError(
+                        f"{name} shape mismatch: batched={tuple(actual.shape)}, "
+                        f"single={tuple(expected.shape)}"
+                    )
+                difference = float(
+                    (actual.float() - expected.float()).abs().max().item()
+                )
+                max_absolute_difference = max(
+                    max_absolute_difference, difference
+                )
+                if not torch.allclose(
+                    actual.float(), expected.float(), rtol=0.05, atol=0.05
+                ):
+                    raise RuntimeError(
+                        f"{name} batch equivalence failed: "
+                        f"max_abs_diff={difference:.6f}"
+                    )
+    finally:
+        if was_training:
+            moss_model.train()
+        torch.cuda.empty_cache()
+
+    result = {
+        "performed": True,
+        "batch_size": batch_size,
+        "audio_frames": [
+            int(value) for value in batch["audio_data_seqlens"].tolist()
+        ],
+        "deepstack_layers": len(batch_deepstack or ()),
+        "max_absolute_difference": max_absolute_difference,
+    }
+    print(f"[deepstack-batch-check] {json.dumps(result)}")
+    return result
+
+
 def main():
     wrapper, trainer_arguments = parse_wrapper_args()
     moss_repo = wrapper.moss_repo.resolve()
@@ -214,6 +451,7 @@ def main():
         "deepstack_non_checkpointed_layers": [],
         "checkpointed_language_layers": [],
         "cache_disabled_configs": [],
+        "batch_collator_validation": None,
     }
 
     class ProfileCallback(TrainerCallback):
@@ -248,6 +486,8 @@ def main():
     def patched_init(self, *args, **kwargs):
         callbacks = list(kwargs.pop("callbacks", None) or [])
         callbacks.append(ProfileCallback())
+        if kwargs.get("data_collator") is None:
+            kwargs["data_collator"] = MossAudioDataCollator()
         original_init(self, *args, callbacks=callbacks, **kwargs)
         captured["trainer"] = self
 
@@ -261,6 +501,7 @@ def main():
             checkpointing_kwargs["use_reentrant"] = False
             self.args.gradient_checkpointing_kwargs = checkpointing_kwargs
             install_safe_gradient_checkpointing(self.model, captured)
+        captured["batch_collator_validation"] = validate_deepstack_batch(self)
         torch.cuda.reset_peak_memory_stats()
         captured["started_at"] = time.perf_counter()
         result = original_train(self, *args, **kwargs)
@@ -277,11 +518,7 @@ def main():
 
     atexit.register(restore_trainer)
 
-    spec = importlib.util.spec_from_file_location(
-        "moss_official_finetune", official_script
-    )
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    module = load_registered_module("moss_official_finetune", official_script)
     module.train()
     restore_trainer()
 
@@ -339,6 +576,9 @@ def main():
             "checkpointed_language_layers"
         ],
         "cache_disabled_configs": captured["cache_disabled_configs"],
+        "batch_collator_validation": captured[
+            "batch_collator_validation"
+        ],
         "loss_history": captured["loss_history"],
         "adapter_size_bytes": directory_size(output_dir, recursive=False),
         "latest_checkpoint": (
