@@ -29,7 +29,7 @@ def downsampled_audio_tokens(frame_count):
 
 
 class MossAudioDataCollator:
-    """Right-pad variable-length mel features without changing sample order."""
+    """Trim text padding and right-pad mel features without reordering."""
 
     def __init__(self):
         self.reported = False
@@ -48,6 +48,33 @@ class MossAudioDataCollator:
                     f"MOSS-Audio sample {index} is missing keys: {sorted(missing)}"
                 )
 
+        sequence_width = int(features[0]["attention_mask"].shape[-1])
+        valid_sequence_lengths = []
+        for index, feature in enumerate(features):
+            attention_values = [
+                int(value) for value in feature["attention_mask"].tolist()
+            ]
+            valid_length = sum(attention_values)
+            if valid_length <= 0 or attention_values != (
+                [1] * valid_length + [0] * (sequence_width - valid_length)
+            ):
+                raise RuntimeError(
+                    f"attention_mask for sample {index} is not right padded"
+                )
+            if any(
+                int(value) != -100
+                for value in feature["labels"][valid_length:].tolist()
+            ):
+                raise RuntimeError(
+                    f"Refusing to trim supervised labels from sample {index}"
+                )
+            if any(feature["audio_input_mask"][valid_length:].tolist()):
+                raise RuntimeError(
+                    f"Refusing to trim audio tokens from sample {index}"
+                )
+            valid_sequence_lengths.append(valid_length)
+        trimmed_sequence_length = max(valid_sequence_lengths)
+
         batch = {}
         for key in FIXED_BATCH_KEYS:
             reference_shape = tuple(features[0][key].shape)
@@ -58,7 +85,9 @@ class MossAudioDataCollator:
                         f"Cannot stack {key}: sample 0 has {reference_shape}, "
                         f"sample {index} has {shape}"
                     )
-            batch[key] = torch.stack([feature[key] for feature in features])
+            batch[key] = torch.stack(
+                [feature[key] for feature in features]
+            )[:, :trimmed_sequence_length]
 
         audio_features = [feature["audio_data"] for feature in features]
         reference_mels = int(audio_features[0].shape[0])
@@ -118,9 +147,11 @@ class MossAudioDataCollator:
         )
         if not self.reported:
             print(
-                "[collator] validated right-padded batch: "
+                "[collator] validated dynamic batch: "
                 f"batch={len(features)}, frames={frame_lengths}, "
-                f"padded_to={max_frames}, audio_tokens={expected_audio_tokens}"
+                f"padded_to={max_frames}, audio_tokens={expected_audio_tokens}, "
+                f"sequence_lengths={valid_sequence_lengths}, "
+                f"trimmed={sequence_width}->{trimmed_sequence_length}"
             )
             self.reported = True
         return batch
@@ -298,6 +329,81 @@ def install_safe_gradient_checkpointing(model, captured):
     model.gradient_checkpointing_enable = safe_enable
 
 
+def validate_dynamic_padding(trainer):
+    import torch
+
+    feature = trainer.train_dataset[0]
+    trimmed_batch = trainer.data_collator([feature])
+    padded_batch = {
+        key: feature[key].unsqueeze(0)
+        for key in FIXED_BATCH_KEYS
+    }
+    padded_batch["audio_data"] = feature["audio_data"].unsqueeze(0)
+    padded_batch["audio_data_seqlens"] = feature[
+        "audio_data_seqlens"
+    ].reshape(1)
+
+    padded_length = int(padded_batch["input_ids"].shape[-1])
+    trimmed_length = int(trimmed_batch["input_ids"].shape[-1])
+    if trimmed_length >= padded_length:
+        raise RuntimeError(
+            "Dynamic padding did not shorten the validation sequence: "
+            f"{padded_length}->{trimmed_length}"
+        )
+
+    model = trainer.model
+    device = next(model.parameters()).device
+    was_training = model.training
+    model.eval()
+
+    def forward_loss(batch):
+        inputs = {
+            key: value.to(device)
+            for key, value in batch.items()
+        }
+        inputs["use_cache"] = False
+        output = model(**inputs)
+        loss = float(output.loss.detach().float().item())
+        del output
+        return loss
+
+    try:
+        with torch.no_grad():
+            padded_loss = forward_loss(padded_batch)
+            torch.cuda.empty_cache()
+            trimmed_loss = forward_loss(trimmed_batch)
+    finally:
+        if was_training:
+            model.train()
+        torch.cuda.empty_cache()
+
+    if not math.isfinite(padded_loss) or not math.isfinite(trimmed_loss):
+        raise RuntimeError(
+            f"Non-finite dynamic-padding loss: "
+            f"padded={padded_loss}, trimmed={trimmed_loss}"
+        )
+    absolute_difference = abs(trimmed_loss - padded_loss)
+    relative_difference = absolute_difference / max(abs(padded_loss), 1e-12)
+    if relative_difference > 0.01:
+        raise RuntimeError(
+            "Dynamic-padding loss equivalence failed: "
+            f"padded={padded_loss:.6f}, trimmed={trimmed_loss:.6f}, "
+            f"relative_diff={relative_difference:.6f}"
+        )
+
+    result = {
+        "performed": True,
+        "padded_length": padded_length,
+        "trimmed_length": trimmed_length,
+        "padded_loss": padded_loss,
+        "trimmed_loss": trimmed_loss,
+        "absolute_loss_difference": absolute_difference,
+        "relative_loss_difference": relative_difference,
+    }
+    print(f"[dynamic-padding-check] {json.dumps(result)}")
+    return result
+
+
 def validate_deepstack_batch(trainer):
     import torch
 
@@ -451,6 +557,7 @@ def main():
         "deepstack_non_checkpointed_layers": [],
         "checkpointed_language_layers": [],
         "cache_disabled_configs": [],
+        "dynamic_padding_validation": None,
         "batch_collator_validation": None,
     }
 
@@ -494,6 +601,9 @@ def main():
     def patched_train(self, *args, **kwargs):
         if resume_path is not None:
             kwargs["resume_from_checkpoint"] = resume_path.as_posix()
+        captured["cache_disabled_configs"] = disable_training_cache(
+            resolve_moss_model(self.model)
+        )
         if self.args.gradient_checkpointing:
             checkpointing_kwargs = dict(
                 self.args.gradient_checkpointing_kwargs or {}
@@ -501,6 +611,7 @@ def main():
             checkpointing_kwargs["use_reentrant"] = False
             self.args.gradient_checkpointing_kwargs = checkpointing_kwargs
             install_safe_gradient_checkpointing(self.model, captured)
+        captured["dynamic_padding_validation"] = validate_dynamic_padding(self)
         captured["batch_collator_validation"] = validate_deepstack_batch(self)
         torch.cuda.reset_peak_memory_stats()
         captured["started_at"] = time.perf_counter()
@@ -576,6 +687,9 @@ def main():
             "checkpointed_language_layers"
         ],
         "cache_disabled_configs": captured["cache_disabled_configs"],
+        "dynamic_padding_validation": captured[
+            "dynamic_padding_validation"
+        ],
         "batch_collator_validation": captured[
             "batch_collator_validation"
         ],
