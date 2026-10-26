@@ -6,9 +6,12 @@ import atexit
 import importlib.util
 import json
 import math
+import os
 import sys
 import time
 from pathlib import Path
+
+os.environ.setdefault("USE_TF", "0")
 
 
 def parse_wrapper_args():
@@ -49,6 +52,126 @@ def directory_size(path, recursive=True):
     return sum(item.stat().st_size for item in files if item.is_file())
 
 
+def resolve_moss_model(model):
+    get_base_model = getattr(model, "get_base_model", None)
+    moss_model = get_base_model() if callable(get_base_model) else model
+    if not hasattr(moss_model, "language_model"):
+        raise RuntimeError(
+            "Could not resolve MossAudioModel from the training model"
+        )
+    return moss_model
+
+
+def disable_training_cache(moss_model):
+    configs = (
+        ("model.config", getattr(moss_model, "config", None)),
+        (
+            "model.config.language_config",
+            getattr(getattr(moss_model, "config", None), "language_config", None),
+        ),
+        (
+            "model.language_model.config",
+            getattr(getattr(moss_model, "language_model", None), "config", None),
+        ),
+    )
+    disabled = []
+    for name, config in configs:
+        if config is not None and hasattr(config, "use_cache"):
+            config.use_cache = False
+            disabled.append(name)
+    if not disabled:
+        raise RuntimeError("No MOSS/Qwen cache configuration was found")
+    if any(
+        getattr(config, "use_cache", None) is not False
+        for _, config in configs
+        if config is not None and hasattr(config, "use_cache")
+    ):
+        raise RuntimeError("Failed to disable use_cache for MOSS training")
+    return disabled
+
+
+def install_safe_gradient_checkpointing(model, captured):
+    original_enable = getattr(model, "gradient_checkpointing_enable", None)
+    if not callable(original_enable):
+        raise RuntimeError("Training model does not support gradient checkpointing")
+
+    moss_model = resolve_moss_model(model)
+    language_model = moss_model.language_model
+    layers = list(getattr(language_model, "layers", ()))
+    deepstack_mergers = list(
+        getattr(moss_model, "deepstack_audio_merger_list", ())
+    )
+    hooked_layer_count = len(deepstack_mergers)
+    if not layers:
+        raise RuntimeError("MOSS language model has no decoder layers")
+    if hooked_layer_count > len(layers):
+        raise RuntimeError(
+            "DeepStack hook count exceeds the number of language-model layers"
+        )
+
+    def safe_enable(gradient_checkpointing_kwargs=None):
+        checkpointing_kwargs = dict(gradient_checkpointing_kwargs or {})
+        checkpointing_kwargs["use_reentrant"] = False
+        disabled_cache_configs = disable_training_cache(moss_model)
+        original_enable(
+            gradient_checkpointing_kwargs=checkpointing_kwargs
+        )
+
+        enable_input_grads = getattr(model, "enable_input_require_grads", None)
+        if not callable(enable_input_grads):
+            raise RuntimeError(
+                "LoRA gradient checkpointing requires input gradients"
+            )
+        enable_input_grads()
+
+        for layer_index, layer in enumerate(layers):
+            if not hasattr(layer, "gradient_checkpointing"):
+                raise RuntimeError(
+                    f"Language-model layer {layer_index} has no "
+                    "gradient_checkpointing flag"
+                )
+            if layer_index < hooked_layer_count:
+                layer.gradient_checkpointing = False
+
+        skipped_layers = [
+            index
+            for index, layer in enumerate(layers)
+            if not layer.gradient_checkpointing
+        ]
+        checkpointed_layers = [
+            index
+            for index, layer in enumerate(layers)
+            if layer.gradient_checkpointing
+        ]
+        expected_skipped = list(range(hooked_layer_count))
+        expected_checkpointed = list(range(hooked_layer_count, len(layers)))
+        if skipped_layers != expected_skipped:
+            raise RuntimeError(
+                "Unexpected non-checkpointed language-model layers: "
+                f"{skipped_layers}; expected {expected_skipped}"
+            )
+        if checkpointed_layers != expected_checkpointed:
+            raise RuntimeError(
+                "Unexpected checkpointed language-model layers: "
+                f"{checkpointed_layers}; expected {expected_checkpointed}"
+            )
+
+        captured["gradient_checkpointing"] = True
+        captured["gradient_checkpointing_kwargs"] = checkpointing_kwargs
+        captured["input_require_grads_enabled"] = True
+        captured["deepstack_non_checkpointed_layers"] = skipped_layers
+        captured["checkpointed_language_layers"] = checkpointed_layers
+        captured["cache_disabled_configs"] = disabled_cache_configs
+        print(
+            "[gradient-checkpointing] "
+            f"DeepStack layers {skipped_layers} excluded; "
+            f"checkpointed layers={len(checkpointed_layers)}/{len(layers)}; "
+            f"kwargs={checkpointing_kwargs}; use_cache=False"
+        )
+
+    model.gradient_checkpointing_enable = safe_enable
+
+
 def main():
     wrapper, trainer_arguments = parse_wrapper_args()
     moss_repo = wrapper.moss_repo.resolve()
@@ -85,6 +208,12 @@ def main():
         "max_lora_gradient_norm": 0.0,
         "nonzero_lora_gradient_parameters": 0,
         "loss_history": [],
+        "gradient_checkpointing": False,
+        "gradient_checkpointing_kwargs": None,
+        "input_require_grads_enabled": False,
+        "deepstack_non_checkpointed_layers": [],
+        "checkpointed_language_layers": [],
+        "cache_disabled_configs": [],
     }
 
     class ProfileCallback(TrainerCallback):
@@ -125,6 +254,13 @@ def main():
     def patched_train(self, *args, **kwargs):
         if resume_path is not None:
             kwargs["resume_from_checkpoint"] = resume_path.as_posix()
+        if self.args.gradient_checkpointing:
+            checkpointing_kwargs = dict(
+                self.args.gradient_checkpointing_kwargs or {}
+            )
+            checkpointing_kwargs["use_reentrant"] = False
+            self.args.gradient_checkpointing_kwargs = checkpointing_kwargs
+            install_safe_gradient_checkpointing(self.model, captured)
         torch.cuda.reset_peak_memory_stats()
         captured["started_at"] = time.perf_counter()
         result = original_train(self, *args, **kwargs)
@@ -189,6 +325,20 @@ def main():
         "nonzero_lora_gradient_parameters": captured[
             "nonzero_lora_gradient_parameters"
         ],
+        "gradient_checkpointing": captured["gradient_checkpointing"],
+        "gradient_checkpointing_kwargs": captured[
+            "gradient_checkpointing_kwargs"
+        ],
+        "input_require_grads_enabled": captured[
+            "input_require_grads_enabled"
+        ],
+        "deepstack_non_checkpointed_layers": captured[
+            "deepstack_non_checkpointed_layers"
+        ],
+        "checkpointed_language_layers": captured[
+            "checkpointed_language_layers"
+        ],
+        "cache_disabled_configs": captured["cache_disabled_configs"],
         "loss_history": captured["loss_history"],
         "adapter_size_bytes": directory_size(output_dir, recursive=False),
         "latest_checkpoint": (
