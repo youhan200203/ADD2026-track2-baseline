@@ -423,6 +423,16 @@ def main():
         real["joint"] + fake["joint"]
     ) / 2
 
+    mean_bertscore_f1 = (
+        (
+            real["mean_bertscore_f1_all"] * real["total"]
+            + fake["mean_bertscore_f1_all"] * fake["total"]
+        )
+        / len(rows)
+        if not args.no_bert
+        else None
+    )
+
     result.update(
         {
             "real": real,
@@ -431,6 +441,7 @@ def main():
                 overall_correct / len(rows)
             ),
             "balanced_accuracy": balanced_accuracy,
+            "mean_bertscore_f1": mean_bertscore_f1,
             "joint_score": (
                 None if args.no_bert else joint_score
             ),
@@ -456,8 +467,15 @@ def main():
     )
 
     if args.no_bert:
+        print("[bert] skipped (--no-bert)")
         print("[joint] skipped (--no-bert)")
     else:
+        print(
+            f"[bert] real={real['mean_bertscore_f1_all']:.6f}, "
+            f"fake={fake['mean_bertscore_f1_all']:.6f}, "
+            f"mean={mean_bertscore_f1:.6f}, "
+            f"mean_100={100 * mean_bertscore_f1:.4f}"
+        )
         print(
             f"[joint] real={real['joint']:.4f}, "
             f"fake={fake['joint']:.4f}, "
