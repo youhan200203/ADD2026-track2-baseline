@@ -7,6 +7,7 @@ deepspeed==0.17.6
 librosa==0.11.0
 modelscope==1.39.1
 numpy==2.4.6
+opensmile==2.6.0
 peft==0.17.0
 qwen-omni-utils==0.0.9
 qwen-vl-utils==0.0.14

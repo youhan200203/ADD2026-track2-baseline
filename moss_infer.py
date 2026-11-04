@@ -27,6 +27,7 @@ def parse_args():
     parser.add_argument("--model-dir", required=True)
     parser.add_argument("--adapter-dir", type=Path, required=True)
     parser.add_argument("--audio-dir", type=Path, required=True)
+    parser.add_argument("--prompt-manifest", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--audio-key-prefix", default="data/dev")
     parser.add_argument("--max-new-tokens", type=int, default=2048)
@@ -38,18 +39,20 @@ def parse_args():
     return parser.parse_args()
 
 
-def prepare_batch(processor, audio_paths, device):
+def prepare_batch(processor, audio_paths, prompts, device):
     import torch
     from src.audio_io import load_audio
 
+    if len(audio_paths) != len(prompts):
+        raise ValueError("audio_paths and prompts must have the same length")
     features = []
-    for audio_path in audio_paths:
+    for audio_path, prompt in zip(audio_paths, prompts):
         raw_audio = load_audio(
             audio_path.as_posix(),
             sample_rate=processor.config.mel_sr,
         )
         item = processor(
-            text=PROMPT,
+            text=prompt,
             audios=[raw_audio],
             return_tensors="pt",
         )
@@ -107,10 +110,12 @@ def prepare_batch(processor, audio_paths, device):
     return batch, int(pad_token_id)
 
 
-def generate_batch(model, processor, audio_paths, args):
+def generate_batch(model, processor, audio_paths, prompts, args):
     import torch
 
-    inputs, pad_token_id = prepare_batch(processor, audio_paths, args.device)
+    inputs, pad_token_id = prepare_batch(
+        processor, audio_paths, prompts, args.device
+    )
     input_width = int(inputs["input_ids"].shape[1])
     with torch.inference_mode():
         output_ids = model.generate(
@@ -153,7 +158,9 @@ def valid_xml_response(response):
     return len(decisions) == 1 and len(evidence) == 1 and bool(evidence[0].strip())
 
 
-def validate_batch_generation(model, processor, audio_paths, args):
+def validate_batch_generation(
+    model, processor, audio_paths, prompt_by_id, args
+):
     from tqdm.auto import tqdm
 
     single_responses = []
@@ -164,7 +171,13 @@ def validate_batch_generation(model, processor, audio_paths, args):
         dynamic_ncols=True,
     )
     for audio_path in single_progress:
-        responses, _ = generate_batch(model, processor, [audio_path], args)
+        responses, _ = generate_batch(
+            model,
+            processor,
+            [audio_path],
+            [prompt_by_id[audio_path.stem]],
+            args,
+        )
         single_responses.extend(responses)
 
     batched_responses = []
@@ -180,6 +193,7 @@ def validate_batch_generation(model, processor, audio_paths, args):
             model,
             processor,
             batch_paths,
+            [prompt_by_id[path.stem] for path in batch_paths],
             args,
         )
         batched_responses.extend(responses)
@@ -271,6 +285,39 @@ def completed_ids(path):
     return completed
 
 
+def load_prompt_manifest(path):
+    prompts = {}
+    with path.open(encoding="utf-8-sig") as handle:
+        for line_number, line in enumerate(handle, 1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ValueError(
+                    f"Invalid JSON at {path}:{line_number}"
+                ) from error
+            file_id = row.get("id")
+            messages = [
+                message
+                for message in row.get("conversation", [])
+                if message.get("role") == "user"
+                and message.get("message_type") == "text"
+            ]
+            if not file_id or file_id in prompts or len(messages) != 1:
+                raise ValueError(
+                    f"Expected a unique id and one user text message at "
+                    f"{path}:{line_number}"
+                )
+            content = messages[0].get("content")
+            if not isinstance(content, str) or not content.strip():
+                raise ValueError(f"Empty prompt at {path}:{line_number}")
+            prompts[file_id] = content
+    if not prompts:
+        raise ValueError(f"Prompt manifest is empty: {path}")
+    return prompts
+
+
 def main():
     args = parse_args()
     import torch
@@ -300,6 +347,21 @@ def main():
     if not args.adapter_dir.is_dir():
         raise FileNotFoundError(args.adapter_dir)
 
+    audio_ids = {path.stem for path in audio_files}
+    if args.prompt_manifest is None:
+        prompt_by_id = {file_id: PROMPT for file_id in audio_ids}
+    else:
+        prompt_by_id = load_prompt_manifest(args.prompt_manifest)
+        missing = audio_ids - set(prompt_by_id)
+        unexpected = set(prompt_by_id) - audio_ids
+        if missing or unexpected:
+            raise ValueError(
+                "Prompt manifest IDs do not match audio IDs: "
+                f"missing={sorted(missing)[:5]}, "
+                f"unexpected={sorted(unexpected)[:5]}"
+            )
+        print(f"[data] per-sample prompts: {args.prompt_manifest}")
+
     if args.validate_batch_samples:
         done = set()
         pending = audio_files[: args.validate_batch_samples]
@@ -310,8 +372,7 @@ def main():
                 f"Output already exists: {args.output}; pass --resume to continue"
             )
         done = completed_ids(args.output) if args.resume else set()
-        valid_ids = {path.stem for path in audio_files}
-        unexpected = done - valid_ids
+        unexpected = done - audio_ids
         if unexpected:
             raise ValueError(
                 f"Output contains unexpected ids: {sorted(unexpected)[:5]}"
@@ -351,7 +412,9 @@ def main():
     )
 
     if args.validate_batch_samples:
-        validate_batch_generation(model, processor, pending, args)
+        validate_batch_generation(
+            model, processor, pending, prompt_by_id, args
+        )
         return
 
     start = time.monotonic()
@@ -367,7 +430,11 @@ def main():
         for batch_start in range(0, len(pending), args.batch_size):
             batch_paths = pending[batch_start : batch_start + args.batch_size]
             responses, batch_tokens = generate_batch(
-                model, processor, batch_paths, args
+                model,
+                processor,
+                batch_paths,
+                [prompt_by_id[path.stem] for path in batch_paths],
+                args,
             )
             generated_tokens += batch_tokens
             for audio_path, response in zip(batch_paths, responses):
